@@ -71,6 +71,7 @@ enum Status { ST_DISCHARGING = 0, ST_CHARGING = 1, ST_FULL = 2, ST_ERROR = 3 };
 struct BatteryInfo
 {
 	std::wstring name;
+	std::wstring key;  // HID path plus device slot; stable across name read failures
 	int percent = -1;   // 0-100, -1 unknown
 	int status = -1;    // Status enum, -1 unknown
 	int level = -1;     // 0 critical, 1 low, 2 good, 3 full
@@ -171,6 +172,7 @@ public:
 			if (g_stop) return false;
 			ULONGLONG now = GetTickCount64();
 			if (now >= end) return false;
+			std::fill(in.begin(), in.end(), 0);
 			int n = Read(in, (DWORD)(end - now));
 			if (n <= 0) return false;
 			if (n < 7) continue;
@@ -186,7 +188,7 @@ public:
 			if (in[2] == feat && in[3] == swByte)
 			{
 				memset(resp, 0, sizeof(resp));
-				size_t avail = std::min<size_t>(16, in.size() > 4 ? in.size() - 4 : 0);
+				size_t avail = std::min<size_t>(16, (size_t)n - 4);
 				memcpy(resp, &in[4], avail);
 				return true;
 			}
@@ -262,6 +264,7 @@ struct Device
 	uint16_t battFeatId = 0;
 	bool socSupported = true;   // 0x1004 only
 	std::wstring name;
+	std::wstring key;
 	BatteryInfo last;
 };
 
@@ -297,6 +300,7 @@ bool ReadBattery(Device& d, BatteryInfo& out)
 	uint8_t r[16];
 	out = BatteryInfo();
 	out.name = d.name;
+	out.key = d.key;
 
 	switch (d.battFeatId)
 	{
@@ -453,6 +457,7 @@ private:
 		Device d;
 		d.ch = ch;
 		d.index = idx;
+		d.key = Lower(ch->Path()) + L"#" + Hex(idx, 2);
 
 		static const uint16_t candidates[] = {FEAT_UNIFIED_BATTERY, FEAT_BATTERY_STATUS, FEAT_BATTERY_VOLTAGE};
 		for (uint16_t id : candidates)
@@ -472,6 +477,16 @@ private:
 			if (ch->Request(idx, d.battFeatIdx, 0x0, {}, r, 500)) d.socSupported = (r[1] & 0x02) != 0;
 		}
 		d.name = ReadDeviceName(*ch, idx);
+		{
+			Lock g(lock_);
+			for (const auto& old : results_)
+			{
+				if (old.key != d.key) continue;
+				if (d.name.empty()) d.name = old.name;
+				d.last = old;
+				break;
+			}
+		}
 		if (d.name.empty()) d.name = L"Logitech device " + Hex(idx, 2);
 		Log(L"found '" + d.name + L"' (battery feature 0x" + Hex(d.battFeatId) + L")");
 		devices_.push_back(std::move(d));
@@ -518,25 +533,37 @@ private:
 			{
 				BatteryInfo bi;
 				if (ReadBattery(d, bi)) d.last = bi;
-				else { anyFail = true; bi = d.last; bi.name = d.name; bi.connected = false; }
+				else { anyFail = true; bi = d.last; bi.name = d.name; bi.key = d.key; bi.connected = false; }
 				fresh.push_back(bi);
 			}
 
 			{
 				Lock g(lock_);
-				// Keep last-known values for devices that dropped off (mouse switched off).
+				// Preserve the previous order so DeviceIndex keeps selecting the same mouse.
+				std::vector<BatteryInfo> ordered;
 				for (const auto& old : results_)
 				{
-					bool present = false;
-					for (const auto& f : fresh) if (f.name == old.name) { present = true; break; }
-					if (!present) { fresh.push_back(old); fresh.back().connected = false; }
+					auto it = std::find_if(fresh.begin(), fresh.end(),
+						[&](const BatteryInfo& f) { return f.key == old.key; });
+					if (it != fresh.end())
+					{
+						ordered.push_back(*it);
+						fresh.erase(it);
+					}
+					else
+					{
+						ordered.push_back(old);
+						ordered.back().connected = false;
+					}
 				}
-				results_ = std::move(fresh);
+				ordered.insert(ordered.end(), fresh.begin(), fresh.end());
+				results_ = std::move(ordered);
 			}
 
 			if (anyFail || devices_.empty() || --rediscoverIn <= 0) needDiscover = true;
 
 			DWORD ms = intervalFn_ ? intervalFn_() : 60000;
+			if (anyFail || devices_.empty()) ms = (std::min)(ms, 5000UL);
 			if (WaitForSingleObject(stopEvt_, ms) == WAIT_OBJECT_0) break;
 		}
 	}
