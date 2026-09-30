@@ -266,6 +266,7 @@ struct Device
 	std::wstring name;
 	std::wstring key;
 	BatteryInfo last;
+	int consecutiveFailures = 0; // avoid treating one lost/sleeping HID reply as a disconnect
 };
 
 bool GetFeatureIndex(Channel& ch, uint8_t dev, uint16_t featId, uint8_t& index)
@@ -528,12 +529,34 @@ private:
 			}
 
 			bool anyFail = false;
+			bool confirmedDisconnect = false;
 			std::vector<BatteryInfo> fresh;
 			for (auto& d : devices_)
 			{
 				BatteryInfo bi;
-				if (ReadBattery(d, bi)) d.last = bi;
-				else { anyFail = true; bi = d.last; bi.name = d.name; bi.key = d.key; bi.connected = false; }
+				if (ReadBattery(d, bi))
+				{
+					d.consecutiveFailures = 0;
+					d.last = bi;
+				}
+				else
+				{
+					anyFail = true;
+					++d.consecutiveFailures;
+					bi = d.last;
+					bi.name = d.name;
+					bi.key = d.key;
+
+					// A single timeout is common when a wireless mouse is waking.
+					// Require two consecutive failed battery reads before declaring
+					// the device disconnected.
+					if (d.consecutiveFailures >= 2)
+					{
+						bi.connected = false;
+						confirmedDisconnect = true;
+						Log(L"lost '" + d.name + L"' after consecutive battery read failures");
+					}
+				}
 				fresh.push_back(bi);
 			}
 
@@ -560,10 +583,15 @@ private:
 				results_ = std::move(ordered);
 			}
 
-			if (anyFail || devices_.empty() || --rediscoverIn <= 0) needDiscover = true;
+			// Do not rebuild all HID channels after just one missed packet.  Once a
+			// disconnect is confirmed, or while no device is present, rediscover on
+			// every fast pass so reconnects are noticed promptly.
+			if (confirmedDisconnect || devices_.empty() || --rediscoverIn <= 0)
+				needDiscover = true;
 
 			DWORD ms = intervalFn_ ? intervalFn_() : 60000;
-			if (anyFail || devices_.empty()) ms = (std::min)(ms, 5000UL);
+			if (anyFail || devices_.empty())
+				ms = (std::min)(ms, 2000UL); // fast retry / reconnect detection
 			if (WaitForSingleObject(stopEvt_, ms) == WAIT_OBJECT_0) break;
 		}
 	}
