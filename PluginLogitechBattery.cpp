@@ -1,3 +1,7 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 // LogitechBattery - Rainmeter plugin that reports battery state of Logitech
 // wireless mice (Unifying / Bolt / Lightspeed receivers and Bluetooth) by
 // talking HID++ 2.0 directly over the Windows HID API. No Logitech software
@@ -6,8 +10,11 @@
 // Built on the Rainmeter Plugin SDK (API/RainmeterAPI.h).
 //
 // Threading model: all HID I/O runs on one background thread that refreshes a
-// cached snapshot every PollInterval seconds. Update() only reads the cache,
+// cached snapshot every 1-2 seconds (PollInterval is capped at 2 seconds). Update() only reads the cache,
 // so a slow or sleeping device can never stall your skin.
+// A Type=Status measure automatically refreshes its skin on valid status changes.
+// Set RefreshOnStatusChange=0 on that measure to disable automatic refresh.
+// Keep UpdateDivider=1 on the Status measure so Rainmeter observes changes.
 
 #include <windows.h>
 #include <setupapi.h>
@@ -19,12 +26,14 @@ extern "C" {
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <cwctype>
 #include <deque>
 #include <initializer_list>
 #include <memory>
 #include <string>
 #include <vector>
+#include <utility>
 
 #include "../../API/RainmeterAPI.h"
 
@@ -368,7 +377,8 @@ public:
 		if (stopEvt_) SetEvent(stopEvt_);
 		if (thread_)
 		{
-			WaitForSingleObject(thread_, 5000);
+			// Do not destroy channels while the worker still owns them.
+			WaitForSingleObject(thread_, INFINITE);
 			CloseHandle(thread_);
 			thread_ = nullptr;
 		}
@@ -380,12 +390,16 @@ public:
 	bool Get(const std::wstring& filter, int index, BatteryInfo& out)
 	{
 		Lock g(lock_);
+		// A cable can expose a new wired path while the old receiver path remains.
+		// Select live devices first so an old disconnected snapshot cannot hide it.
 		int n = 0;
-		for (const auto& r : results_)
-		{
-			if (!filter.empty() && !ContainsNoCase(r.name, filter)) continue;
-			if (++n == index) { out = r; return true; }
-		}
+		for (bool connected : {true, false})
+			for (const auto& r : results_)
+			{
+				if (r.connected != connected) continue;
+				if (!filter.empty() && !ContainsNoCase(r.name, filter)) continue;
+				if (++n == index) { out = r; return true; }
+			}
 		return false;
 	}
 
@@ -494,10 +508,10 @@ private:
 		return true;
 	}
 
-	void Discover()
+	void Discover(const std::vector<std::wstring>& paths)
 	{
 		devices_.clear();
-		for (const auto& path : EnumerateLogitechPaths())
+		for (const auto& path : paths)
 		{
 			if (g_stop) return;
 			auto ch = std::make_shared<Channel>();
@@ -518,17 +532,22 @@ private:
 	void Run()
 	{
 		bool needDiscover = true;
-		int rediscoverIn = 0;
+		ULONGLONG rediscoverAt = 0;
+		std::vector<std::wstring> previousPaths;
 		while (!g_stop)
 		{
+			auto paths = EnumerateLogitechPaths();
+			std::sort(paths.begin(), paths.end());
+			if (paths != previousPaths || GetTickCount64() >= rediscoverAt)
+				needDiscover = true;
 			if (needDiscover)
 			{
-				Discover();
+				Discover(paths);
+				previousPaths = paths;
 				needDiscover = false;
-				rediscoverIn = 20;
+				rediscoverAt = GetTickCount64() + 60000;
 			}
 
-			bool anyFail = false;
 			bool confirmedDisconnect = false;
 			std::vector<BatteryInfo> fresh;
 			for (auto& d : devices_)
@@ -541,7 +560,6 @@ private:
 				}
 				else
 				{
-					anyFail = true;
 					++d.consecutiveFailures;
 					bi = d.last;
 					bi.name = d.name;
@@ -586,12 +604,13 @@ private:
 			// Do not rebuild all HID channels after just one missed packet.  Once a
 			// disconnect is confirmed, or while no device is present, rediscover on
 			// every fast pass so reconnects are noticed promptly.
-			if (confirmedDisconnect || devices_.empty() || --rediscoverIn <= 0)
+			if (confirmedDisconnect || devices_.empty())
 				needDiscover = true;
 
 			DWORD ms = intervalFn_ ? intervalFn_() : 60000;
-			if (anyFail || devices_.empty())
-				ms = (std::min)(ms, 2000UL); // fast retry / reconnect detection
+			// Always check battery state and HID topology at least every two seconds.
+			// Discovery / device response time is additional to this wait.
+			ms = (std::min)(ms, 2000UL);
 			if (WaitForSingleObject(stopEvt_, ms) == WAIT_OBJECT_0) break;
 		}
 	}
@@ -616,7 +635,11 @@ struct Measure
 	Type type = Type::Percent;
 	std::wstring deviceName;
 	int deviceIndex = 1;
-	DWORD intervalMs = 60000;
+	std::atomic<DWORD> intervalMs{2000};
+	void* skin = nullptr;
+	bool refreshOnStatusChange = true;
+	bool haveStatus = false;
+	int previousStatus = -1;
 	bool debug = false;
 	std::wstring str;
 };
@@ -631,7 +654,10 @@ DWORD MinInterval()
 	DWORD best = 60000;
 	bool first = true;
 	for (auto* m : g_measures)
-		if (first || m->intervalMs < best) { best = m->intervalMs; first = false; }
+	{
+		const DWORD interval = m->intervalMs.load();
+		if (first || interval < best) { best = interval; first = false; }
+	}
 	return best;
 }
 
@@ -655,6 +681,7 @@ PLUGIN_EXPORT void Initialize(void** data, void* rm)
 {
 	auto* m = new Measure;
 	m->rm = rm;
+	m->skin = RmGetSkin(rm);
 	*data = m;
 
 	Lock g(g_measuresLock);
@@ -689,7 +716,8 @@ PLUGIN_EXPORT void Reload(void* data, void* rm, double* maxValue)
 	m->deviceName = RmReadString(rm, L"DeviceName", L"");
 	m->deviceIndex = (std::max)(1, RmReadInt(rm, L"DeviceIndex", 1));
 	m->debug = RmReadInt(rm, L"Debug", 0) != 0;
-	int secs = (std::max)(5, RmReadInt(rm, L"PollInterval", 60));
+	m->refreshOnStatusChange = RmReadInt(rm, L"RefreshOnStatusChange", 1) != 0;
+	int secs = (std::min)(3600, (std::max)(1, RmReadInt(rm, L"PollInterval", 2)));
 	m->intervalMs = (DWORD)secs * 1000;
 
 	if (m->type == Type::Percent) *maxValue = 100.0;
@@ -717,8 +745,24 @@ PLUGIN_EXPORT double Update(void* data)
 	case Type::Level: return found && bi.level >= 0 ? bi.level : 0.0;
 	case Type::Connected: return found && bi.connected ? 1.0 : 0.0;
 	case Type::Status:
-		m->str = StatusText(found ? bi.status : -1);
-		return found && bi.status >= 0 ? bi.status : -1.0;
+	{
+		const int status = found && bi.connected ? bi.status : -1;
+		m->str = StatusText(status);
+		bool refresh = false;
+		if (status >= 0)
+		{
+			// Keep the last valid state across temporary wireless read failures.
+			// First successful read establishes the baseline, avoiding refresh loops.
+			refresh = m->haveStatus && m->previousStatus != status
+				&& m->refreshOnStatusChange;
+			m->previousStatus = status;
+			m->haveStatus = true;
+		}
+		// Execute on Rainmeter's update thread, never on the HID worker.
+		// RmExecute queues the command; no measure access follows this call.
+		if (refresh) RmExecute(m->skin, L"[!Refresh]");
+		return status;
+	}
 	case Type::Name:
 		m->str = found ? bi.name : L"";
 		return 0.0;
