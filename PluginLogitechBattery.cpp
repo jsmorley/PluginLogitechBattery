@@ -72,8 +72,8 @@ namespace {
 	{
 		std::wstring name;
 		std::wstring key;  // HID path plus device slot; stable across name read failures
-		int percent = -1;   // 0-100, -1 unknown
-		int status = -1;    // Status enum, -1 unknown
+		int percent = -1;   // 0-100, -1 checking
+		int status = -1;    // Status enum, -1 checking
 		int level = -1;     // 0 critical, 1 low, 2 good, 3 full
 		int voltage = 0;    // mV, only for devices that report it
 		bool connected = false;
