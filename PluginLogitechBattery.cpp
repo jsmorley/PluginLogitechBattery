@@ -66,7 +66,7 @@ std::atomic<bool> g_stop{false};
 
 // ------------------------------------------------------------- data model
 
-enum Status { ST_DISCHARGING = 0, ST_CHARGING = 1, ST_FULL = 2, ST_ERROR = 3 };
+enum Status { ST_BATTERY = 0, ST_CHARGING = 1, ST_FULL = 2, ST_ERROR = 3 };
 
 struct BatteryInfo
 {
@@ -311,7 +311,7 @@ bool ReadBattery(Device& d, BatteryInfo& out)
 		out.level = (mask & 0x08) ? 3 : (mask & 0x04) ? 2 : (mask & 0x02) ? 1 : 0;
 		if (d.socSupported) out.percent = soc;
 		else out.percent = out.level == 3 ? 100 : out.level == 2 ? 60 : out.level == 1 ? 20 : 5;
-		out.status = (chg == 0) ? ST_DISCHARGING : (chg == 1 || chg == 2) ? ST_CHARGING
+		out.status = (chg == 0) ? ST_BATTERY : (chg == 1 || chg == 2) ? ST_CHARGING
 			: (chg == 3) ? ST_FULL : ST_ERROR;
 		break;
 	}
@@ -320,7 +320,7 @@ bool ReadBattery(Device& d, BatteryInfo& out)
 		if (!d.ch->Request(d.index, d.battFeatIdx, 0x0, {}, r, 800)) return false;
 		out.percent = r[0];
 		int s = r[2];
-		out.status = (s == 0) ? ST_DISCHARGING : (s == 1 || s == 2 || s == 4) ? ST_CHARGING
+		out.status = (s == 0) ? ST_BATTERY : (s == 1 || s == 2 || s == 4) ? ST_CHARGING
 			: (s == 3) ? ST_FULL : ST_ERROR;
 		out.level = LevelFromPercent(out.percent);
 		break;
@@ -333,7 +333,7 @@ bool ReadBattery(Device& d, BatteryInfo& out)
 		out.percent = PercentFromVoltage(out.voltage);
 		out.level = LevelFromPercent(out.percent);
 		if (flags & 0x80) out.status = ((flags & 0x03) == 0x01) ? ST_FULL : ST_CHARGING;
-		else out.status = ST_DISCHARGING;
+		else out.status = ST_BATTERY;
 		break;
 	}
 	default:
@@ -611,7 +611,7 @@ const wchar_t* StatusText(int s)
 {
 	switch (s)
 	{
-	case ST_DISCHARGING: return L"Discharging";
+	case ST_BATTERY: return L"Battery";
 	case ST_CHARGING: return L"Charging";
 	case ST_FULL: return L"Full";
 	case ST_ERROR: return L"Error";
