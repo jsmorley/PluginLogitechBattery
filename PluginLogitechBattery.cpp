@@ -13,6 +13,8 @@
 // cached snapshot every 1-2 seconds (PollInterval is capped at 2 seconds). Update() only reads the cache,
 // so a slow or sleeping device can never stall your skin.
 // A Type=Status measure automatically refreshes its skin on valid status changes.
+// Silent devices retain their last valid state while their HID path exists.
+// Sleep and power-off behind a connected receiver cannot be distinguished here.
 // Set RefreshOnStatusChange=0 on that measure to disable automatic refresh.
 // Keep UpdateDivider=1 on the Status measure so Rainmeter observes changes.
 
@@ -86,6 +88,8 @@ struct BatteryInfo
 	int level = -1;     // 0 critical, 1 low, 2 good, 3 full
 	int voltage = 0;    // mV, only for devices that report it
 	bool connected = false;
+	bool responding = false; // valid battery reply on this polling pass
+	bool direct = false;     // direct HID path, rather than a receiver slot
 };
 
 int LevelFromPercent(int p)
@@ -275,7 +279,8 @@ struct Device
 	std::wstring name;
 	std::wstring key;
 	BatteryInfo last;
-	int consecutiveFailures = 0; // avoid treating one lost/sleeping HID reply as a disconnect
+	bool silent = false;       // no reply: possible sleep, not a confirmed disconnect
+	ULONGLONG recoverAt = 0;   // throttle handle/feature recovery during silence
 };
 
 bool GetFeatureIndex(Channel& ch, uint8_t dev, uint16_t featId, uint8_t& index)
@@ -350,6 +355,8 @@ bool ReadBattery(Device& d, BatteryInfo& out)
 		return false;
 	}
 	out.connected = true;
+	out.responding = true;
+	out.direct = d.index == 0xFF;
 	return true;
 }
 
@@ -398,7 +405,21 @@ public:
 			{
 				if (r.connected != connected) continue;
 				if (!filter.empty() && !ContainsNoCase(r.name, filter)) continue;
-				if (++n == index) { out = r; return true; }
+				if (++n == index)
+				{
+					out = r;
+					// Cached receiver state must not mask a live cable response.
+					// Keep the selected position, then choose the best transport
+					// for the same reported device name. Do not merge fallback names.
+					auto rank = [](const BatteryInfo& b) {
+						return !b.connected ? 0 : !b.responding ? 1 : b.direct ? 3 : 2;
+					};
+					if (!r.name.empty() && r.name.find(L"Logitech device ") != 0)
+						for (const auto& alternative : results_)
+							if (Lower(alternative.name) == Lower(r.name)
+								&& rank(alternative) > rank(out)) out = alternative;
+					return true;
+				}
 			}
 		return false;
 	}
@@ -467,6 +488,44 @@ private:
 		return false;  // silent on both tries
 	}
 
+	bool ConfigureBattery(Device& d)
+	{
+		// Commit only after discovery succeeds; silence leaves old indices intact.
+		Device candidate = d;
+		candidate.battFeatId = 0;
+		static const uint16_t candidates[] = {FEAT_UNIFIED_BATTERY, FEAT_BATTERY_STATUS, FEAT_BATTERY_VOLTAGE};
+		for (uint16_t id : candidates)
+		{
+			uint8_t fi = 0;
+			if (GetFeatureIndex(*candidate.ch, candidate.index, id, fi)) { candidate.battFeatIdx = fi; candidate.battFeatId = id; break; }
+		}
+		if (!candidate.battFeatId)
+		{
+			Log(L"device index " + Hex(candidate.index, 2) + L": HID++ 2.0 but no supported battery feature");
+			return false;
+		}
+		if (candidate.battFeatId == FEAT_UNIFIED_BATTERY)
+		{
+			uint8_t r[16];
+			// GetCapabilities: flags bit 1 = state-of-charge percentage supported
+			if (candidate.ch->Request(candidate.index, candidate.battFeatIdx, 0x0, {}, r, 500)) candidate.socSupported = (r[1] & 0x02) != 0;
+		}
+		d.battFeatId = candidate.battFeatId;
+		d.battFeatIdx = candidate.battFeatIdx;
+		d.socSupported = candidate.socSupported;
+		return true;
+	}
+
+	void RecoverChannel(Device& d)
+	{
+		const auto old = d.ch;
+		auto replacement = std::make_shared<Channel>();
+		if (!replacement->Open(old->Path()) || !replacement->SpeaksHidppLong()) return;
+		for (auto& other : devices_)
+			if (other.ch == old) other.ch = replacement;
+		ConfigureBattery(d);
+	}
+
 	bool TryAdd(const std::shared_ptr<Channel>& ch, uint8_t idx)
 	{
 		Device d;
@@ -474,23 +533,7 @@ private:
 		d.index = idx;
 		d.key = Lower(ch->Path()) + L"#" + Hex(idx, 2);
 
-		static const uint16_t candidates[] = {FEAT_UNIFIED_BATTERY, FEAT_BATTERY_STATUS, FEAT_BATTERY_VOLTAGE};
-		for (uint16_t id : candidates)
-		{
-			uint8_t fi = 0;
-			if (GetFeatureIndex(*ch, idx, id, fi)) { d.battFeatIdx = fi; d.battFeatId = id; break; }
-		}
-		if (!d.battFeatId)
-		{
-			Log(L"device index " + Hex(idx, 2) + L": HID++ 2.0 but no supported battery feature");
-			return false;
-		}
-		if (d.battFeatId == FEAT_UNIFIED_BATTERY)
-		{
-			uint8_t r[16];
-			// GetCapabilities: flags bit 1 = state-of-charge percentage supported
-			if (ch->Request(idx, d.battFeatIdx, 0x0, {}, r, 500)) d.socSupported = (r[1] & 0x02) != 0;
-		}
+		if (!ConfigureBattery(d)) return false;
 		d.name = ReadDeviceName(*ch, idx);
 		{
 			Lock g(lock_);
@@ -508,24 +551,45 @@ private:
 		return true;
 	}
 
-	void Discover(const std::vector<std::wstring>& paths)
+	void Discover(const std::vector<std::wstring>& paths, bool topologyChanged)
 	{
-		devices_.clear();
+		// Keep known devices and their feature indices through silent/sleeping polls.
+		// Only removal of the HID path is evidence of a transport disconnect.
+		devices_.erase(std::remove_if(devices_.begin(), devices_.end(),
+			[&](const Device& d) {
+				return std::find(paths.begin(), paths.end(), d.ch->Path()) == paths.end();
+			}), devices_.end());
 		for (const auto& path : paths)
 		{
 			if (g_stop) return;
-			auto ch = std::make_shared<Channel>();
-			if (!ch->Open(path)) continue;
-			if (!ch->SpeaksHidppLong()) continue;
-			Log(L"HID++ channel: " + path);
+			auto known = std::find_if(devices_.begin(), devices_.end(),
+				[&](const Device& d) { return d.ch->Path() == path; });
+			std::shared_ptr<Channel> ch;
+			if (known != devices_.end())
+			{
+				if (topologyChanged) RecoverChannel(*known);
+				ch = known->ch;
+				if (known->index == 0xFF) continue;
+			}
+			else
+			{
+				ch = std::make_shared<Channel>();
+				if (!ch->Open(path)) continue;
+				if (!ch->SpeaksHidppLong()) continue;
+				Log(L"HID++ channel: " + path);
+			}
 
-			if (Probe(*ch, 0xFF))  // directly connected (Bluetooth / wired)
+			if (known == devices_.end() && Probe(*ch, 0xFF))  // directly connected (Bluetooth / wired)
 			{
 				TryAdd(ch, 0xFF);
 				continue;
 			}
 			for (uint8_t idx = 1; idx <= 6 && !g_stop; ++idx)  // receiver slots
-				if (Probe(*ch, idx)) TryAdd(ch, idx);
+			{
+				const bool alreadyKnown = std::any_of(devices_.begin(), devices_.end(),
+					[&](const Device& d) { return d.ch == ch && d.index == idx; });
+				if (!alreadyKnown && Probe(*ch, idx)) TryAdd(ch, idx);
+			}
 		}
 	}
 
@@ -542,38 +606,40 @@ private:
 				needDiscover = true;
 			if (needDiscover)
 			{
-				Discover(paths);
+				Discover(paths, paths != previousPaths);
 				previousPaths = paths;
 				needDiscover = false;
 				rediscoverAt = GetTickCount64() + 60000;
 			}
 
-			bool confirmedDisconnect = false;
 			std::vector<BatteryInfo> fresh;
 			for (auto& d : devices_)
 			{
+				const ULONGLONG now = GetTickCount64();
+				if (d.silent && now >= d.recoverAt)
+				{
+					d.recoverAt = now + 5000;
+					RecoverChannel(d);
+				}
 				BatteryInfo bi;
 				if (ReadBattery(d, bi))
 				{
-					d.consecutiveFailures = 0;
+					if (d.silent) Log(L"battery replies resumed for '" + d.name + L"'");
+					d.silent = false;
+					d.recoverAt = now + 5000;
 					d.last = bi;
 				}
 				else
 				{
-					++d.consecutiveFailures;
+					if (!d.silent)
+						Log(L"no battery reply from '" + d.name + L"'; retaining cached state (possible sleep)");
+					d.silent = true;
 					bi = d.last;
+					bi.responding = false;
 					bi.name = d.name;
 					bi.key = d.key;
-
-					// A single timeout is common when a wireless mouse is waking.
-					// Require two consecutive failed battery reads before declaring
-					// the device disconnected.
-					if (d.consecutiveFailures >= 2)
-					{
-						bi.connected = false;
-						confirmedDisconnect = true;
-						Log(L"lost '" + d.name + L"' after consecutive battery read failures");
-					}
+					// Do not change Connected, Status or battery values on silence.
+					// Polling continues so a valid wake/charging reply updates normally.
 				}
 				fresh.push_back(bi);
 			}
@@ -595,17 +661,15 @@ private:
 					{
 						ordered.push_back(old);
 						ordered.back().connected = false;
+						ordered.back().responding = false;
 					}
 				}
 				ordered.insert(ordered.end(), fresh.begin(), fresh.end());
 				results_ = std::move(ordered);
 			}
 
-			// Do not rebuild all HID channels after just one missed packet.  Once a
-			// disconnect is confirmed, or while no device is present, rediscover on
-			// every fast pass so reconnects are noticed promptly.
-			if (confirmedDisconnect || devices_.empty())
-				needDiscover = true;
+			// Empty discovery retries promptly; known silent devices remain cached.
+			if (devices_.empty()) needDiscover = true;
 
 			DWORD ms = intervalFn_ ? intervalFn_() : 60000;
 			// Always check battery state and HID topology at least every two seconds.
