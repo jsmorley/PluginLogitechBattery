@@ -13,7 +13,7 @@ software required, and it coexists with G HUB / Options+.
 | PollInterval | seconds, min 5 (shared poller uses the smallest set) | 60 |
 | Debug | 1 logs discovery to the Rainmeter log | 0 |
 
-Numeric values: Percent 0-100; Status 0 discharging / 1 charging / 2 full / 3 error (string form is
+Numeric values: Percent 0-100; Status 0 Battery / 1 Charging / 2 Full / 3 Error (string form is
 the text); Level 0 critical / 1 low / 2 good / 3 full; Voltage in mV (only some devices);
 Connected 1/0 (0 means the numbers are last-known values).
 
