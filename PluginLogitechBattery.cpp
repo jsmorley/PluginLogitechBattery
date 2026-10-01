@@ -518,7 +518,6 @@ namespace {
 				}
 			}
 			if (d.name.empty()) d.name = L"Logitech device " + Hex(idx, 2);
-			Log(L"found '" + d.name + L"' (battery feature 0x" + Hex(d.battFeatId) + L")");
 			devices_.push_back(std::move(d));
 			return true;
 		}
@@ -549,6 +548,18 @@ namespace {
 				{
 					return (a.index == 0xFF) > (b.index == 0xFF);
 				});
+
+			// Log devices using the same 1-based index used by DeviceIndex.
+			for (size_t i = 0; i < devices_.size(); ++i)
+			{
+				const auto& d = devices_[i];
+				Log(
+					L"device " + std::to_wstring(i + 1) +
+					L": '" + d.name +
+					L"' (battery feature 0x" + Hex(d.battFeatId) +
+					L", HID++ index 0x" + Hex(d.index, 2) + L")"
+				);
+			}
 		}
 
 		void Run()
