@@ -267,6 +267,7 @@ namespace {
 		std::wstring name;
 		std::wstring key;
 		BatteryInfo last;
+		int consecutiveFailures = 0; // debounce transient HID++ read failures
 	};
 
 	bool GetFeatureIndex(Channel& ch, uint8_t dev, uint16_t featId, uint8_t& index)
@@ -602,15 +603,31 @@ namespace {
 					for (auto& d : devices_)
 					{
 						BatteryInfo bi;
-						if (ReadBattery(d, bi)) d.last = bi;
+
+						if (ReadBattery(d, bi))
+						{
+							// Successful communication: the device is definitely connected.
+							d.consecutiveFailures = 0;
+							d.last = bi;
+						}
 						else
 						{
 							anyFail = true;
+							++d.consecutiveFailures;
+
+							// Preserve the last known battery information. A single failed
+							// HID++ request is common with sleeping or briefly busy devices
+							// and does not by itself mean that the device disconnected.
 							bi = d.last;
 							bi.name = d.name;
 							bi.key = d.key;
 							bi.direct = (d.index == 0xFF);
-							bi.connected = false;
+
+							constexpr int DISCONNECT_FAILURE_COUNT = 3;
+							if (d.consecutiveFailures >= DISCONNECT_FAILURE_COUNT)
+								bi.connected = false;
+							else
+								bi.connected = d.last.connected;
 						}
 						fresh.push_back(bi);
 					}
@@ -651,9 +668,15 @@ namespace {
 					}
 
 					topologyChanged = false;
-					if (anyFail || devices_.empty() || --rediscoverIn <= 0) needDiscover = true;
+
+					// Do not rediscover the entire device list just because one battery
+					// request timed out. Actual USB / HID topology changes are detected
+					// independently once per second above. Periodic rediscovery is retained.
+					if (devices_.empty() || --rediscoverIn <= 0) needDiscover = true;
 
 					DWORD interval = intervalFn_ ? intervalFn_() : 60000;
+					// Retry failed battery communication sooner without rebuilding the
+					// device list.
 					if (anyFail || devices_.empty()) interval = (std::min)(interval, 5000UL);
 					nextBatteryPoll = GetTickCount64() + interval;
 				}
@@ -778,7 +801,11 @@ PLUGIN_EXPORT double Update(void* data)
 	if (m->debug && g_poller)
 	{
 		std::wstring line;
-		while (g_poller->PopLog(line)) RmLog(m->rm, LOG_DEBUG, (L"LogitechBattery: " + line).c_str());
+		// Debug=1 is a plugin option, so log discovery information at NOTICE
+		// level. LOG_DEBUG is suppressed unless Rainmeter's global Debug mode
+		// is enabled, which would otherwise make Debug=1 ineffective by itself.
+		while (g_poller->PopLog(line))
+			RmLog(m->rm, LOG_NOTICE, (L"LogitechBattery: " + line).c_str());
 	}
 
 	BatteryInfo bi;
