@@ -267,8 +267,16 @@ namespace {
 		std::wstring name;
 		std::wstring key;
 		BatteryInfo last;
-		int consecutiveFailures = 0; // debounce transient HID++ read failures
+		int consecutiveFailures = 0; // diagnostic / logging aid
+		ULONGLONG failureSince = 0;  // first tick of the current uninterrupted read-failure streak
+		bool nonresponsive = false;  // true after the failure streak survives the grace period
 	};
+
+	// A sleeping / briefly busy Logitech device can miss several HID++ requests.
+	// Do not change Connected=1 to Connected=0 until communication has been
+	// continuously absent for this long. Real HID topology changes are handled
+	// separately and still take effect immediately.
+	constexpr ULONGLONG NONRESPONSE_GRACE_MS = 30000;
 
 	bool GetFeatureIndex(Channel& ch, uint8_t dev, uint16_t featId, uint8_t& index)
 	{
@@ -483,6 +491,23 @@ namespace {
 			return false;  // silent on both tries
 		}
 
+		// Look only for a directly-addressed HID++ 2.0 transport (device index 0xFF).
+		// This is intentionally much lighter than a full Discover(): it does not probe
+		// receiver slots 1-6, so checking for a newly attached USB cable does not keep
+		// talking to / waking a sleeping wireless mouse.
+		static bool DirectTransportPresent()
+		{
+			for (const auto& path : EnumerateLogitechPaths())
+			{
+				if (g_stop) return false;
+				Channel ch;
+				if (!ch.Open(path)) continue;
+				if (!ch.SpeaksHidppLong()) continue;
+				if (Probe(ch, 0xFF)) return true;
+			}
+			return false;
+		}
+
 		bool TryAdd(const std::shared_ptr<Channel>& ch, uint8_t idx)
 		{
 			Device d;
@@ -523,9 +548,15 @@ namespace {
 			return true;
 		}
 
-		void Discover()
+		void Discover(bool preserveMissing)
 		{
+			// Keep the previous Device objects around during an ordinary periodic
+			// rediscovery. Probe / feature requests can transiently fail even though
+			// the mouse is still present. In that case we keep the old channel and let
+			// the normal non-response debounce decide whether it is really unavailable.
+			auto previous = std::move(devices_);
 			devices_.clear();
+
 			for (const auto& path : EnumerateLogitechPaths())
 			{
 				if (g_stop) return;
@@ -541,6 +572,30 @@ namespace {
 				}
 				for (uint8_t idx = 1; idx <= 6 && !g_stop; ++idx)  // receiver slots
 					if (Probe(*ch, idx)) TryAdd(ch, idx);
+			}
+
+			if (preserveMissing)
+			{
+				for (auto& old : previous)
+				{
+					auto it = std::find_if(devices_.begin(), devices_.end(),
+						[&](const Device& d) { return d.key == old.key; });
+
+					if (it != devices_.end())
+					{
+						// Preserve an in-progress failure streak across periodic rediscovery.
+						// Otherwise each rediscovery could restart the debounce timer forever.
+						it->consecutiveFailures = old.consecutiveFailures;
+						it->failureSince = old.failureSince;
+						it->nonresponsive = old.nonresponsive;
+					}
+					else
+					{
+						Log(L"device '" + old.name +
+							L"' missed by periodic discovery; preserving it until sustained non-response");
+						devices_.push_back(std::move(old));
+					}
+				}
 			}
 
 			// A mouse connected by USB can also remain visible through its receiver.
@@ -567,12 +622,18 @@ namespace {
 		{
 			bool needDiscover = true;
 			bool topologyChanged = false;
-			int rediscoverIn = 0;
 			ULONGLONG nextBatteryPoll = 0;
+			ULONGLONG nextPeriodicDiscover = 0;
+			ULONGLONG nextDirectWatch = 0;
+			bool directWatchEnabled = false;
+			bool knownDirectPresent = false;
+			int directMissingChecks = 0;
 			std::vector<std::wstring> knownPaths;
 
 			while (!g_stop)
 			{
+				ULONGLONG now = GetTickCount64();
+
 				// SetupAPI enumeration is cheap compared with talking HID++ to a sleeping
 				// mouse. Check the interface set once per second, independently of the
 				// configured battery PollInterval. Plugging/unplugging the USB cable then
@@ -586,16 +647,80 @@ namespace {
 				}
 				knownPaths = std::move(paths);
 
-				if (needDiscover)
+				// Some Logitech mice do not cause the HID path list to change when the
+				// charging/data cable is attached or removed. When a receiver-backed device
+				// is known, lightly probe only device index 0xFF for a direct USB transport.
+				// This catches the cable transition without probing receiver slots and
+				// without weakening the normal sleep/non-response debounce.
+				if (!needDiscover && directWatchEnabled && now >= nextDirectWatch)
 				{
-					Discover();
-					knownPaths = LogitechPathSignature();
-					needDiscover = false;
-					rediscoverIn = 20;
-					nextBatteryPoll = 0;  // read the newly discovered transport immediately
+					bool directNow = DirectTransportPresent();
+
+					if (!knownDirectPresent && directNow)
+					{
+						Log(L"direct HID++ transport appeared; rediscovering");
+						knownDirectPresent = true;
+						directMissingChecks = 0;
+						needDiscover = true;
+						topologyChanged = true;
+					}
+					else if (knownDirectPresent && !directNow)
+					{
+						// A direct/wired transport should not sleep, but tolerate one missed
+						// probe so a single transient I/O failure cannot look like cable removal.
+						if (++directMissingChecks >= 2)
+						{
+							Log(L"direct HID++ transport disappeared; rediscovering");
+							knownDirectPresent = false;
+							directMissingChecks = 0;
+							needDiscover = true;
+							topologyChanged = true;
+						}
+					}
+					else
+					{
+						directMissingChecks = 0;
+					}
+
+					nextDirectWatch = GetTickCount64() + 2000;
 				}
 
-				ULONGLONG now = GetTickCount64();
+				// Periodic discovery is time-based rather than retry-count-based. A sleeping
+				// device may be retried every 5 seconds, and those retries must not make the
+				// full discovery pass happen 12x more often than intended.
+				if (!needDiscover && nextPeriodicDiscover != 0 && now >= nextPeriodicDiscover)
+					needDiscover = true;
+
+				if (needDiscover)
+				{
+					// Only a real HID topology change is allowed to discard a previously known
+					// device immediately. Ordinary periodic discovery preserves probe misses.
+					const bool preserveMissing = !topologyChanged && !devices_.empty();
+					Discover(preserveMissing);
+					knownPaths = LogitechPathSignature();
+					needDiscover = false;
+					nextBatteryPoll = 0;  // read the newly discovered transport immediately
+
+					// Enable the lightweight direct-transport watcher only when at least one
+					// receiver-backed device is known. This avoids treating sleep of a
+					// Bluetooth-only direct device as a USB cable transition.
+					bool haveReceiver = false;
+					bool haveDirect = false;
+					for (const auto& d : devices_)
+					{
+						if (d.index == 0xFF) haveDirect = true;
+						else haveReceiver = true;
+					}
+					directWatchEnabled = haveReceiver;
+					knownDirectPresent = haveDirect;
+					directMissingChecks = 0;
+					nextDirectWatch = GetTickCount64() + 2000;
+
+					DWORD baseInterval = intervalFn_ ? intervalFn_() : 60000;
+					nextPeriodicDiscover = GetTickCount64() + (ULONGLONG)baseInterval * 20ULL;
+				}
+
+				now = GetTickCount64();
 				if (now >= nextBatteryPoll)
 				{
 					bool anyFail = false;
@@ -606,28 +731,44 @@ namespace {
 
 						if (ReadBattery(d, bi))
 						{
-							// Successful communication: the device is definitely connected.
+							// Successful communication is authoritative. One success immediately
+							// clears a prior sleep/non-response state.
+							if (d.nonresponsive)
+								Log(L"device '" + d.name + L"' is responding again");
 							d.consecutiveFailures = 0;
+							d.failureSince = 0;
+							d.nonresponsive = false;
 							d.last = bi;
 						}
 						else
 						{
 							anyFail = true;
 							++d.consecutiveFailures;
+							if (d.failureSince == 0) d.failureSince = now;
 
-							// Preserve the last known battery information. A single failed
-							// HID++ request is common with sleeping or briefly busy devices
-							// and does not by itself mean that the device disconnected.
+							// Preserve the last known battery information. Short HID++ timeouts
+							// are common and must not make Connected flap between 1 and 0.
 							bi = d.last;
 							bi.name = d.name;
 							bi.key = d.key;
 							bi.direct = (d.index == 0xFF);
 
-							constexpr int DISCONNECT_FAILURE_COUNT = 3;
-							if (d.consecutiveFailures >= DISCONNECT_FAILURE_COUNT)
-								bi.connected = false;
+							const ULONGLONG silentMs = now - d.failureSince;
+							if (d.last.connected && silentMs < NONRESPONSE_GRACE_MS)
+							{
+								// Still inside the debounce window: hold the previous connected state.
+								bi.connected = true;
+							}
 							else
-								bi.connected = d.last.connected;
+							{
+								bi.connected = false;
+								if (!d.nonresponsive && d.last.connected)
+								{
+									d.nonresponsive = true;
+									Log(L"device '" + d.name +
+										L"' has not responded for 30 seconds; treating it as sleeping/disconnected");
+								}
+							}
 						}
 						fresh.push_back(bi);
 					}
@@ -657,6 +798,7 @@ namespace {
 								}
 								else
 								{
+									// This should now mostly happen only for a real device/path removal.
 									ordered.push_back(old);
 									ordered.back().connected = false;
 								}
@@ -669,14 +811,14 @@ namespace {
 
 					topologyChanged = false;
 
-					// Do not rediscover the entire device list just because one battery
-					// request timed out. Actual USB / HID topology changes are detected
-					// independently once per second above. Periodic rediscovery is retained.
-					if (devices_.empty() || --rediscoverIn <= 0) needDiscover = true;
+					// If nothing is currently known, keep trying discovery. Otherwise periodic
+					// discovery is scheduled by wall-clock time above and is not accelerated
+					// by the 5-second failure retry loop.
+					if (devices_.empty()) needDiscover = true;
 
 					DWORD interval = intervalFn_ ? intervalFn_() : 60000;
-					// Retry failed battery communication sooner without rebuilding the
-					// device list.
+					// Retry failed battery communication sooner without rebuilding the device
+					// list. This lets wake-up be recognized quickly.
 					if (anyFail || devices_.empty()) interval = (std::min)(interval, 5000UL);
 					nextBatteryPoll = GetTickCount64() + interval;
 				}
