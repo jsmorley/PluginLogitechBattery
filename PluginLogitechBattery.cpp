@@ -252,10 +252,18 @@ namespace {
 	// ----------------------------------------------------------- HID++ device
 
 	// HID++ 2.0 feature ids
+	constexpr uint16_t FEAT_DEVICE_INFORMATION = 0x0003; // unit/model identity across transports
 	constexpr uint16_t FEAT_DEVICE_NAME = 0x0005;
 	constexpr uint16_t FEAT_BATTERY_STATUS = 0x1000;   // percent + status
 	constexpr uint16_t FEAT_BATTERY_VOLTAGE = 0x1001;  // millivolts + flags
 	constexpr uint16_t FEAT_UNIFIED_BATTERY = 0x1004;  // percent/level + status
+
+	struct DeviceIdentity
+	{
+		uint32_t unitId = 0;
+		uint16_t modelId[3] = { 0, 0, 0 };
+		bool available = false;
+	};
 
 	struct Device
 	{
@@ -266,6 +274,7 @@ namespace {
 		bool socSupported = true;   // 0x1004 only
 		std::wstring name;
 		std::wstring key;
+		DeviceIdentity identity;
 		BatteryInfo last;
 		int consecutiveFailures = 0; // diagnostic / logging aid
 		ULONGLONG failureSince = 0;  // first tick of the current uninterrupted read-failure streak
@@ -303,6 +312,45 @@ namespace {
 			if ((int)name.size() == before) break;
 		}
 		return std::wstring(name.begin(), name.end());
+	}
+
+	DeviceIdentity ReadDeviceIdentity(Channel& ch, uint8_t dev)
+	{
+		DeviceIdentity id;
+		uint8_t fi = 0, r[16];
+		if (!GetFeatureIndex(ch, dev, FEAT_DEVICE_INFORMATION, fi)) return id;
+		if (!ch.Request(dev, fi, 0x0, {}, r, 500)) return id;
+
+		// HID++ 2.0 feature 0x0003, GetDeviceInfo:
+		//   bytes 1..4  = unit ID
+		//   bytes 7..12 = three transport/application model IDs (big endian)
+		id.unitId = (uint32_t(r[1]) << 24) | (uint32_t(r[2]) << 16) |
+			(uint32_t(r[3]) << 8) | uint32_t(r[4]);
+		id.modelId[0] = (uint16_t(r[7]) << 8) | uint16_t(r[8]);
+		id.modelId[1] = (uint16_t(r[9]) << 8) | uint16_t(r[10]);
+		id.modelId[2] = (uint16_t(r[11]) << 8) | uint16_t(r[12]);
+
+		// Fail closed.  Older feature versions can report zero identity fields; in
+		// that case we deliberately do NOT use the direct-transport watcher rather
+		// than risk mistaking another Logitech device for this mouse.
+		id.available = id.unitId != 0 &&
+			(id.modelId[0] != 0 || id.modelId[1] != 0 || id.modelId[2] != 0);
+		return id;
+	}
+
+	bool SamePhysicalDevice(const DeviceIdentity& a, const DeviceIdentity& b)
+	{
+		if (!a.available || !b.available) return false;
+		if (a.unitId != b.unitId) return false;
+
+		// The model-id tuple contains the application PIDs for the transports the
+		// firmware exposes.  Require at least one common non-zero PID rather than
+		// requiring byte-for-byte tuple equality, since a transport can report a
+		// subset of the same physical device's supported transport IDs.
+		for (uint16_t x : a.modelId)
+			for (uint16_t y : b.modelId)
+				if (x != 0 && x == y) return true;
+		return false;
 	}
 
 	bool ReadBattery(Device& d, BatteryInfo& out)
@@ -478,6 +526,57 @@ namespace {
 			return paths;
 		}
 
+		static int HexDigit(wchar_t c)
+		{
+			if (c >= L'0' && c <= L'9') return c - L'0';
+			if (c >= L'a' && c <= L'f') return c - L'a' + 10;
+			if (c >= L'A' && c <= L'F') return c - L'A' + 10;
+			return -1;
+		}
+
+		// Extract the USB product ID from a normal Windows HID path, e.g.
+		// "...vid_046d&pid_c09b&..." -> 0xC09B.  This is used only as a cheap
+		// pre-filter; HID++ identity is still the authoritative final match.
+		static bool HidPathPid(const std::wstring& path, uint16_t& pid)
+		{
+			auto p = Lower(path);
+			size_t pos = p.find(L"pid_");
+			if (pos == std::wstring::npos || pos + 8 > p.size()) return false;
+
+			unsigned value = 0;
+			for (size_t i = 0; i < 4; ++i)
+			{
+				int d = HexDigit(p[pos + 4 + i]);
+				if (d < 0) return false;
+				value = (value << 4) | (unsigned)d;
+			}
+			pid = (uint16_t)value;
+			return true;
+		}
+
+		static std::vector<uint16_t> ReceiverModelPids(const std::vector<Device>& devices)
+		{
+			std::vector<uint16_t> pids;
+			for (const auto& d : devices)
+			{
+				if (d.index == 0xFF || !d.identity.available) continue;
+				for (uint16_t pid : d.identity.modelId)
+				{
+					if (pid == 0) continue;
+					if (std::find(pids.begin(), pids.end(), pid) == pids.end())
+						pids.push_back(pid);
+				}
+			}
+			return pids;
+		}
+
+		static bool PathMatchesModelPids(const std::wstring& path, const std::vector<uint16_t>& pids)
+		{
+			uint16_t pid = 0;
+			if (!HidPathPid(path, pid)) return false;
+			return std::find(pids.begin(), pids.end(), pid) != pids.end();
+		}
+
 		static bool Probe(Channel& ch, uint8_t dev)
 		{
 			uint8_t r[16];
@@ -495,18 +594,78 @@ namespace {
 		// This is intentionally much lighter than a full Discover(): it does not probe
 		// receiver slots 1-6, so checking for a newly attached USB cable does not keep
 		// talking to / waking a sleeping wireless mouse.
-		static bool DirectTransportPresent()
+		static bool DirectTransportPresent(const std::vector<Device>& knownDevices)
 		{
+			// First derive the possible direct-transport USB PIDs dynamically from
+			// the receiver-backed device's HID++ Device Information.  No model or
+			// product ID is hardcoded here.
+			auto targetPids = ReceiverModelPids(knownDevices);
+			if (targetPids.empty()) return false;
+
+			// A direct transport only counts as the receiver-backed mouse's wired
+			// transport when all four tests pass:
+			//   1) its Windows HID path PID is one reported by the receiver device,
+			//   2) it responds at 0xFF,
+			//   3) it exposes a supported battery feature, and
+			//   4) feature 0x0003 reports the same unit ID + model IDs.
+			// The PID test is only a fast rejection filter.  The unit/model identity
+			// comparison remains authoritative.
+			static const uint16_t candidates[] = {
+				FEAT_UNIFIED_BATTERY, FEAT_BATTERY_STATUS, FEAT_BATTERY_VOLTAGE
+			};
+
 			for (const auto& path : EnumerateLogitechPaths())
 			{
 				if (g_stop) return false;
+
+				// Crucially, do this before CreateFile / HID++ probing.  A Logitech
+				// keyboard, receiver, headset, etc. with a different PID costs nothing
+				// beyond enumeration and cannot delay the cable watcher.
+				if (!PathMatchesModelPids(path, targetPids)) continue;
+
 				Channel ch;
 				if (!ch.Open(path)) continue;
 				if (!ch.SpeaksHidppLong()) continue;
-				if (Probe(ch, 0xFF)) return true;
+				if (!Probe(ch, 0xFF)) continue;
+
+				bool hasBattery = false;
+				for (uint16_t id : candidates)
+				{
+					uint8_t fi = 0;
+					if (GetFeatureIndex(ch, 0xFF, id, fi))
+					{
+						hasBattery = true;
+						break;
+					}
+				}
+				if (!hasBattery) continue;
+
+				DeviceIdentity directId = ReadDeviceIdentity(ch, 0xFF);
+				if (!directId.available) continue;
+
+				for (const auto& d : knownDevices)
+				{
+					if (d.index == 0xFF) continue;
+					if (SamePhysicalDevice(directId, d.identity)) return true;
+				}
 			}
 			return false;
 		}
+
+		static bool HasMatchedDirectPair(const std::vector<Device>& devices)
+		{
+			for (const auto& direct : devices)
+			{
+				if (direct.index != 0xFF || !direct.identity.available) continue;
+				for (const auto& receiver : devices)
+				{
+					if (receiver.index == 0xFF) continue;
+					if (SamePhysicalDevice(direct.identity, receiver.identity)) return true;
+				}
+			}
+			return false;
+		}
+
 
 		bool TryAdd(const std::shared_ptr<Channel>& ch, uint8_t idx)
 		{
@@ -533,6 +692,7 @@ namespace {
 				if (ch->Request(idx, d.battFeatIdx, 0x0, {}, r, 500)) d.socSupported = (r[1] & 0x02) != 0;
 			}
 			d.name = ReadDeviceName(*ch, idx);
+			d.identity = ReadDeviceIdentity(*ch, idx);
 			{
 				Lock g(lock_);
 				for (const auto& old : results_)
@@ -555,6 +715,7 @@ namespace {
 			// the mouse is still present. In that case we keep the old channel and let
 			// the normal non-response debounce decide whether it is really unavailable.
 			auto previous = std::move(devices_);
+			auto knownReceiverPids = ReceiverModelPids(previous);
 			devices_.clear();
 
 			for (const auto& path : EnumerateLogitechPaths())
@@ -565,16 +726,34 @@ namespace {
 				if (!ch->SpeaksHidppLong()) continue;
 				Log(L"HID++ channel: " + path);
 
-				if (Probe(*ch, 0xFF))  // directly connected (Bluetooth / wired)
+				// Once we have learned receiver identity, avoid even probing 0xFF on
+				// unrelated Logitech product IDs.  Initial discovery still remains fully
+				// generic because knownReceiverPids is empty on first startup.
+				const bool mayBeDirect = knownReceiverPids.empty() ||
+					PathMatchesModelPids(path, knownReceiverPids);
+
+				if (mayBeDirect && Probe(*ch, 0xFF))  // possibly directly connected (Bluetooth / wired)
 				{
-					TryAdd(ch, 0xFF);
-					continue;
+					// Do not let a receiver that merely answers the 0xFF root ping suppress
+					// scanning of slots 1-6.  It is a real direct battery device only if
+					// TryAdd() can actually resolve a supported battery feature at 0xFF.
+					if (TryAdd(ch, 0xFF))
+						continue;
 				}
 				for (uint8_t idx = 1; idx <= 6 && !g_stop; ++idx)  // receiver slots
 					if (Probe(*ch, idx)) TryAdd(ch, idx);
 			}
 
-			if (preserveMissing)
+			// Discovery is deliberately fail-safe.  A full scan can transiently find
+			// nothing at all if Windows briefly refuses an HID handle or the device misses
+			// the probe.  Never let that one bad scan erase every known device; doing so
+			// makes results_ empty and sends every Rainmeter measure back to its default.
+			if (devices_.empty() && !previous.empty())
+			{
+				Log(L"discovery found no usable devices; keeping previous device cache");
+				devices_ = std::move(previous);
+			}
+			else if (preserveMissing)
 			{
 				for (auto& old : previous)
 				{
@@ -609,11 +788,17 @@ namespace {
 			for (size_t i = 0; i < devices_.size(); ++i)
 			{
 				const auto& d = devices_[i];
+				std::wstring identityText = d.identity.available
+					? (L", unit 0x" + Hex(d.identity.unitId, 8) +
+						L", models 0x" + Hex(d.identity.modelId[0]) +
+						L"/0x" + Hex(d.identity.modelId[1]) +
+						L"/0x" + Hex(d.identity.modelId[2]))
+					: L", identity unavailable";
 				Log(
 					L"device " + std::to_wstring(i + 1) +
 					L": '" + d.name +
 					L"' (battery feature 0x" + Hex(d.battFeatId) +
-					L", HID++ index 0x" + Hex(d.index, 2) + L")"
+					L", HID++ index 0x" + Hex(d.index, 2) + identityText + L")"
 				);
 			}
 		}
@@ -627,25 +812,62 @@ namespace {
 			ULONGLONG nextDirectWatch = 0;
 			bool directWatchEnabled = false;
 			bool knownDirectPresent = false;
+			int directPresentChecks = 0;
 			int directMissingChecks = 0;
 			std::vector<std::wstring> knownPaths;
+			std::vector<std::wstring> pendingPaths;
+			int pathChangeChecks = 0;
+
+			// A SetupAPI enumeration can occasionally omit an interface for one pass.
+			// Require the same changed signature to be seen three times in a row before
+			// treating it as a real plug/unplug topology change.
+			constexpr int PATH_CHANGE_CONFIRMATIONS = 3;
+
+			// The direct 0xFF probe can also miss transiently.  Require repeated agreement
+			// before declaring that the wired/direct transport appeared or disappeared.
+			constexpr int DIRECT_CHANGE_CONFIRMATIONS = 3;
 
 			while (!g_stop)
 			{
 				ULONGLONG now = GetTickCount64();
 
 				// SetupAPI enumeration is cheap compared with talking HID++ to a sleeping
-				// mouse. Check the interface set once per second, independently of the
-				// configured battery PollInterval. Plugging/unplugging the USB cable then
-				// causes an immediate rediscovery without increasing battery traffic.
+				// mouse, but it is not perfectly stable: Windows can transiently omit one
+				// HID collection.  Do not rediscover on a single differing enumeration.
 				auto paths = LogitechPathSignature();
-				if (!knownPaths.empty() && paths != knownPaths)
+
+				if (knownPaths.empty())
 				{
-					Log(L"Logitech HID topology changed; rediscovering");
-					needDiscover = true;
-					topologyChanged = true;
+					knownPaths = paths;
+					pendingPaths.clear();
+					pathChangeChecks = 0;
 				}
-				knownPaths = std::move(paths);
+				else if (paths == knownPaths)
+				{
+					// Back to the known-good signature: any candidate change was noise.
+					pendingPaths.clear();
+					pathChangeChecks = 0;
+				}
+				else
+				{
+					if (paths == pendingPaths)
+						++pathChangeChecks;
+					else
+					{
+						pendingPaths = paths;
+						pathChangeChecks = 1;
+					}
+
+					if (pathChangeChecks >= PATH_CHANGE_CONFIRMATIONS)
+					{
+						Log(L"Logitech HID topology change confirmed; rediscovering");
+						knownPaths = paths;
+						pendingPaths.clear();
+						pathChangeChecks = 0;
+						needDiscover = true;
+						topologyChanged = true;
+					}
+				}
 
 				// Some Logitech mice do not cause the HID path list to change when the
 				// charging/data cable is attached or removed. When a receiver-backed device
@@ -654,32 +876,45 @@ namespace {
 				// without weakening the normal sleep/non-response debounce.
 				if (!needDiscover && directWatchEnabled && now >= nextDirectWatch)
 				{
-					bool directNow = DirectTransportPresent();
+					bool directNow = DirectTransportPresent(devices_);
 
-					if (!knownDirectPresent && directNow)
+					if (!knownDirectPresent)
 					{
-						Log(L"direct HID++ transport appeared; rediscovering");
-						knownDirectPresent = true;
 						directMissingChecks = 0;
-						needDiscover = true;
-						topologyChanged = true;
-					}
-					else if (knownDirectPresent && !directNow)
-					{
-						// A direct/wired transport should not sleep, but tolerate one missed
-						// probe so a single transient I/O failure cannot look like cable removal.
-						if (++directMissingChecks >= 2)
+						if (directNow)
 						{
-							Log(L"direct HID++ transport disappeared; rediscovering");
-							knownDirectPresent = false;
-							directMissingChecks = 0;
-							needDiscover = true;
-							topologyChanged = true;
+							if (++directPresentChecks >= DIRECT_CHANGE_CONFIRMATIONS)
+							{
+								Log(L"direct HID++ transport appearance confirmed; rediscovering");
+								knownDirectPresent = true;
+								directPresentChecks = 0;
+								needDiscover = true;
+								topologyChanged = true;
+							}
+						}
+						else
+						{
+							directPresentChecks = 0;
 						}
 					}
 					else
 					{
-						directMissingChecks = 0;
+						directPresentChecks = 0;
+						if (!directNow)
+						{
+							if (++directMissingChecks >= DIRECT_CHANGE_CONFIRMATIONS)
+							{
+								Log(L"direct HID++ transport disappearance confirmed; rediscovering");
+								knownDirectPresent = false;
+								directMissingChecks = 0;
+								needDiscover = true;
+								topologyChanged = true;
+							}
+						}
+						else
+						{
+							directMissingChecks = 0;
+						}
 					}
 
 					nextDirectWatch = GetTickCount64() + 2000;
@@ -698,26 +933,39 @@ namespace {
 					const bool preserveMissing = !topologyChanged && !devices_.empty();
 					Discover(preserveMissing);
 					knownPaths = LogitechPathSignature();
+					pendingPaths.clear();
+					pathChangeChecks = 0;
 					needDiscover = false;
 					nextBatteryPoll = 0;  // read the newly discovered transport immediately
 
 					// Enable the lightweight direct-transport watcher only when at least one
 					// receiver-backed device is known. This avoids treating sleep of a
 					// Bluetooth-only direct device as a USB cable transition.
-					bool haveReceiver = false;
-					bool haveDirect = false;
+					bool haveIdentifiedReceiver = false;
 					for (const auto& d : devices_)
 					{
-						if (d.index == 0xFF) haveDirect = true;
-						else haveReceiver = true;
+						if (d.index != 0xFF && d.identity.available)
+						{
+							haveIdentifiedReceiver = true;
+							break;
+						}
 					}
-					directWatchEnabled = haveReceiver;
-					knownDirectPresent = haveDirect;
+					directWatchEnabled = haveIdentifiedReceiver;
+					knownDirectPresent = HasMatchedDirectPair(devices_);
+					directPresentChecks = 0;
 					directMissingChecks = 0;
 					nextDirectWatch = GetTickCount64() + 2000;
 
+					// Full discovery is a safety net, not part of normal battery polling.
+					// Keep it independent of a short PollInterval so PollInterval=5 does not
+					// cause an expensive scan of every Logitech HID collection every 100 sec.
+					// Real USB/HID topology changes and the matching-direct-device watcher
+					// still trigger rediscovery immediately.
+					constexpr ULONGLONG MIN_PERIODIC_DISCOVER_MS = 5ULL * 60ULL * 1000ULL;
 					DWORD baseInterval = intervalFn_ ? intervalFn_() : 60000;
-					nextPeriodicDiscover = GetTickCount64() + (ULONGLONG)baseInterval * 20ULL;
+					ULONGLONG periodicMs = (ULONGLONG)baseInterval * 20ULL;
+					if (periodicMs < MIN_PERIODIC_DISCOVER_MS) periodicMs = MIN_PERIODIC_DISCOVER_MS;
+					nextPeriodicDiscover = GetTickCount64() + periodicMs;
 				}
 
 				now = GetTickCount64();
@@ -779,10 +1027,13 @@ namespace {
 
 						if (topologyChanged)
 						{
-							// On a cable transition, use discovery order. Discover() puts the
-							// direct USB transport first, preventing the old receiver entry
-							// from masking the newly reported Charging/Battery state.
-							ordered = fresh;
+							// On a confirmed cable/topology transition, use discovery order.
+							// However, never replace a valid published snapshot with an empty
+							// one just because this scan/read cycle failed transiently.
+							if (!fresh.empty())
+								ordered = fresh;
+							else
+								ordered = results_;
 						}
 						else
 						{
