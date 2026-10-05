@@ -1126,6 +1126,18 @@ namespace {
 		return best;
 	}
 
+	const wchar_t* LevelText(int level)
+	{
+		switch (level)
+		{
+		case 0: return L"Critical";
+		case 1: return L"Low";
+		case 2: return L"Good";
+		case 3: return L"Full";
+		}
+		return L"Checking";
+	}
+
 	const wchar_t* StatusText(int s)
 	{
 		switch (s)
@@ -1209,7 +1221,9 @@ PLUGIN_EXPORT double Update(void* data)
 	{
 	case Type::Percent: return found && bi.percent >= 0 ? bi.percent : 0.0;
 	case Type::Voltage: return found ? bi.voltage : 0.0;
-	case Type::Level: return found && bi.level >= 0 ? bi.level : 0.0;
+	case Type::Level:
+		m->str = LevelText(found ? bi.level : -1);
+		return found && bi.level >= 0 ? bi.level : 0.0;
 	case Type::Connected: return found && bi.connected ? 1.0 : 0.0;
 	case Type::Status:
 		m->str = StatusText(found ? bi.status : -1);
@@ -1221,11 +1235,11 @@ PLUGIN_EXPORT double Update(void* data)
 	return 0.0;
 }
 
-// Returns text for Status / Name; nullptr lets Rainmeter format the number.
+// Returns text for Status / Level / Name; nullptr lets Rainmeter format the number.
 PLUGIN_EXPORT LPCWSTR GetString(void* data)
 {
 	auto* m = static_cast<Measure*>(data);
-	if (m->type == Type::Status || m->type == Type::Name) return m->str.c_str();
+	if (m->type == Type::Status || m->type == Type::Level || m->type == Type::Name) return m->str.c_str();
 	return nullptr;
 }
 

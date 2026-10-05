@@ -14,7 +14,8 @@ software required, and it coexists with G HUB / Options+.
 | Debug | 1 logs discovery to the Rainmeter log | 0 |
 
 Numeric values: Percent 0-100; Status 0 Battery / 1 Charging / 2 Full / 3 Error (string form is
-the text); Level 0 critical / 1 low / 2 good / 3 full; Voltage in mV (only some devices);
+the text); Level 0 Critical / 1 Low / 2 Good / 3 Full (string form is the text,
+or Checking while unavailable); Voltage in mV (only some devices);
 Connected 1/0 (0 means the numbers are last-known values).
 
 ## Build
